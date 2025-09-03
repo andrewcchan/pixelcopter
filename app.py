@@ -44,7 +44,7 @@ class CriticNetwork(nn.Module):
         return self.fc(x)
 
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, allowed_actions, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda=0.95):
+    def __init__(self, state_dim, action_dim, allowed_actions, lr, gamma, K_epochs, eps_clip, gae_lambda=0.95):
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
@@ -55,8 +55,7 @@ class PPOAgent:
 
         self.actor = ActorNetwork(state_dim, action_dim)
         self.critic = CriticNetwork(state_dim)
-        self.optimizer_actor = optim.Adam(self.actor.parameters(), lr=lr_actor)
-        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
 
         self.memory = []
         self.state_dim = state_dim
@@ -65,11 +64,12 @@ class PPOAgent:
         self.state_count = 0
 
     def normalize_state(self, state):
+        # Simple running mean and std normalization
         state_vec = np.array(list(state.values()), dtype=np.float32)
         self.state_count += 1
-        self.running_state_mean = self.running_state_mean * (1 - 1/self.state_count) + state_vec * (1/self.state_count)
-        self.running_state_std = self.running_state_std * (1 - 1/self.state_count) + ((state_vec - self.running_state_mean) ** 2) * (1/self.state_count)
-        std = np.sqrt(self.running_state_std + 1e-8)
+        self.running_state_mean = self.running_state_mean + (state_vec - self.running_state_mean) / self.state_count
+        self.running_state_std = self.running_state_std + ((state_vec - self.running_state_mean)**2 - self.running_state_std) / self.state_count
+        std = np.sqrt(self.running_state_std + 1e-5)
         return (state_vec - self.running_state_mean) / std
 
     def select_action(self, state):
@@ -127,13 +127,11 @@ class PPOAgent:
 
             critic_loss = 0.5 * (state_values - returns).pow(2).mean()
 
-            loss = actor_loss + critic_loss - 0.01 * dist_entropy.mean()
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * dist_entropy.mean()
 
-            self.optimizer_actor.zero_grad()
-            self.optimizer_critic.zero_grad()
+            self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer_actor.step()
-            self.optimizer_critic.step()
+            self.optimizer.step()
 
         self.memory = []
 
@@ -148,12 +146,11 @@ class PPOAgent:
         return action_logprobs, torch.squeeze(state_value), dist_entropy
 
 # --- Hyperparameters ---
-lr_actor = 0.0003
-lr_critic = 0.001
+lr = 0.0003
 gamma = 0.99
-K_epochs = 4
+K_epochs = 10
 eps_clip = 0.2
-update_timestep = 2000
+update_timestep = 4096
 
 # --- Training ---
 action_set = p.getActionSet()
@@ -161,11 +158,15 @@ state_keys = list(p.getGameState().keys())
 state_dim = len(state_keys)
 action_dim = len(action_set)
 
-agent = PPOAgent(state_dim, action_dim, action_set, lr_actor, lr_critic, gamma, K_epochs, eps_clip)
+agent = PPOAgent(state_dim, action_dim, action_set, lr, gamma, K_epochs, eps_clip)
 
 time_step = 0
-for i_episode in range(1, 1001):
+episode_rewards = []
+
+for i_episode in range(1, 2001):
+    p.reset_game()
     state = p.getGameState()
+    episode_reward = 0
     for t in range(1000):
         time_step += 1
         action, state_tensor, action_idx, log_prob, value = agent.select_action(state)
@@ -174,6 +175,8 @@ for i_episode in range(1, 1001):
 
         agent.store_transition(state_tensor, action_idx, log_prob, reward, done, value)
 
+        episode_reward += reward
+
         if time_step % update_timestep == 0:
             agent.update()
 
@@ -181,7 +184,14 @@ for i_episode in range(1, 1001):
         if done:
             break
 
-    print(f"Episode {i_episode} finished.")
+    episode_rewards.append(episode_reward)
+
+    if i_episode % 100 == 0:
+        avg_reward = np.mean(episode_rewards[-100:])
+        print(f"Episode {i_episode}\tAverage Reward: {avg_reward:.2f}")
+
+final_avg_reward = np.mean(episode_rewards)
+print(f"Training complete. Final average reward: {final_avg_reward:.2f}")
 
 # --- Save, Record, Evaluate ---
 def record_video(agent, filename="pixelcopter_agent_ppo.mp4", max_steps=1000):
