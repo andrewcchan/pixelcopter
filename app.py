@@ -14,40 +14,58 @@ p = PLE(game, fps=30, display_screen=True)
 p.init()
 
 
-# Policy Gradient Agent using REINFORCE
-class PolicyNetwork(nn.Module):
+# Actor-Critic Networks for PPO
+class ActorNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(input_dim, 32),
+            nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Linear(32, output_dim),
-            nn.Softmax(dim=-1)
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
         )
+
     def forward(self, x):
         return self.fc(x)
 
-class PolicyGradientAgent:
-    def __init__(self, allowed_actions, state_keys, lr=1e-3):
-        self.allowed_actions = allowed_actions
-        self.state_keys = state_keys
+class CriticNetwork(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.fc(x)
+
+class PPOAgent:
+    def __init__(self, state_dim, action_dim, allowed_actions, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda=0.95):
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.gae_lambda = gae_lambda
+
         self.action_map = {i: a for i, a in enumerate(allowed_actions)}
         self.action_inv_map = {a: i for i, a in enumerate(allowed_actions)}
-        self.policy = PolicyNetwork(len(state_keys), len(allowed_actions))
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
-        self.running_state_mean = np.zeros(len(state_keys))
-        self.running_state_std = np.ones(len(state_keys))
+
+        self.actor = ActorNetwork(state_dim, action_dim)
+        self.critic = CriticNetwork(state_dim)
+        self.optimizer_actor = optim.Adam(self.actor.parameters(), lr=lr_actor)
+        self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=lr_critic)
+
+        self.memory = []
+        self.state_dim = state_dim
+        self.running_state_mean = np.zeros(state_dim)
+        self.running_state_std = np.ones(state_dim)
         self.state_count = 0
-        self.baseline = 0.0
-        self.baseline_alpha = 0.99  # running average baseline
-        self.entropy_beta = 0.01    # entropy regularization strength
 
     def normalize_state(self, state):
-        # Update running mean and std, then normalize
-        state_vec = np.array([state[k] for k in self.state_keys], dtype=np.float32)
+        state_vec = np.array(list(state.values()), dtype=np.float32)
         self.state_count += 1
         self.running_state_mean = self.running_state_mean * (1 - 1/self.state_count) + state_vec * (1/self.state_count)
         self.running_state_std = self.running_state_std * (1 - 1/self.state_count) + ((state_vec - self.running_state_mean) ** 2) * (1/self.state_count)
@@ -55,77 +73,118 @@ class PolicyGradientAgent:
         return (state_vec - self.running_state_mean) / std
 
     def select_action(self, state):
-        state_vec = self.normalize_state(state)
-        state_tensor = torch.tensor(state_vec, dtype=torch.float32)
-        probs = self.policy(state_tensor)
-        m = torch.distributions.Categorical(probs)
-        action_idx = m.sample()
-        self.log_probs.append(m.log_prob(action_idx))
-        self.entropies.append(m.entropy())
-        return self.action_map[action_idx.item()]
+        state_norm = self.normalize_state(state)
+        state_tensor = torch.tensor(state_norm, dtype=torch.float32)
 
-    def record_reward(self, reward):
-        self.rewards.append(reward)
+        with torch.no_grad():
+            action_logits = self.actor(state_tensor)
+            value = self.critic(state_tensor)
 
-    def finish_episode(self, gamma=0.99):
-        R = 0
-        returns = []
-        for r in reversed(self.rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, dtype=torch.float32)
-        # Baseline: running mean of returns
-        mean_return = returns.mean().item()
-        self.baseline = self.baseline_alpha * self.baseline + (1 - self.baseline_alpha) * mean_return
-        baseline_tensor = torch.full_like(returns, self.baseline)
-        advantages = returns - baseline_tensor
-        # Normalize advantages
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        log_probs = torch.stack(self.log_probs)
-        entropies = torch.stack(self.entropies)
-        loss = -torch.sum(log_probs * advantages) - self.entropy_beta * torch.sum(entropies)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
+        dist = torch.distributions.Categorical(logits=action_logits)
+        action_idx = dist.sample()
+        log_prob = dist.log_prob(action_idx)
 
-# ...existing code...
-action_set = p.getActionSet()
+        return self.action_map[action_idx.item()], state_tensor, action_idx, log_prob, value
 
-reward = 0.0
-nb_episodes = 1000
-max_steps = 1000
+    def store_transition(self, state, action_idx, log_prob, reward, done, value):
+        self.memory.append((state, action_idx, log_prob, reward, done, value))
+
+    def update(self):
+        old_states, old_actions, old_logprobs, rewards, dones, old_values = zip(*self.memory)
+
+        # Convert to tensor
+        old_states = torch.squeeze(torch.stack(list(old_states), dim=0)).detach()
+        old_actions = torch.squeeze(torch.stack(list(old_actions), dim=0)).detach()
+        old_logprobs = torch.squeeze(torch.stack(list(old_logprobs), dim=0)).detach()
+        old_values = torch.squeeze(torch.stack(list(old_values), dim=0)).detach()
+
+        # Calculate advantages using GAE
+        advantages = []
+        last_advantage = 0
+        last_value = old_values[-1]
+        for i in reversed(range(len(rewards))):
+            if dones[i]:
+                mask = 0
+            else:
+                mask = 1
+            delta = rewards[i] + self.gamma * last_value * mask - old_values[i]
+            last_advantage = delta + self.gamma * self.gae_lambda * last_advantage * mask
+            advantages.insert(0, last_advantage)
+            last_value = old_values[i]
+
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        returns = advantages + old_values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+
+        # Optimize policy for K epochs
+        for _ in range(self.K_epochs):
+            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
+            ratios = torch.exp(logprobs - old_logprobs.detach())
+
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
+
+            critic_loss = 0.5 * (state_values - returns).pow(2).mean()
+
+            loss = actor_loss + critic_loss - 0.01 * dist_entropy.mean()
+
+            self.optimizer_actor.zero_grad()
+            self.optimizer_critic.zero_grad()
+            loss.backward()
+            self.optimizer_actor.step()
+            self.optimizer_critic.step()
+
+        self.memory = []
+
+    def evaluate(self, state, action):
+        action_logits = self.actor(state)
+        dist = torch.distributions.Categorical(logits=action_logits)
+
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_value = self.critic(state)
+
+        return action_logprobs, torch.squeeze(state_value), dist_entropy
+
+# --- Hyperparameters ---
+lr_actor = 0.0003
+lr_critic = 0.001
+gamma = 0.99
+K_epochs = 4
+eps_clip = 0.2
+update_timestep = 2000
+
+# --- Training ---
 action_set = p.getActionSet()
 state_keys = list(p.getGameState().keys())
-agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
+state_dim = len(state_keys)
+action_dim = len(action_set)
 
-episode_rewards = []
-for episode in range(nb_episodes):
-    p.reset_game()
+agent = PPOAgent(state_dim, action_dim, action_set, lr_actor, lr_critic, gamma, K_epochs, eps_clip)
+
+time_step = 0
+for i_episode in range(1, 1001):
     state = p.getGameState()
-    total_reward = 0
-    for t in range(max_steps):
-        if p.game_over():
-            break
-        action = agent.select_action(state)
+    for t in range(1000):
+        time_step += 1
+        action, state_tensor, action_idx, log_prob, value = agent.select_action(state)
         reward = p.act(action)
-        agent.record_reward(reward)
-        total_reward += reward
+        done = p.game_over()
+
+        agent.store_transition(state_tensor, action_idx, log_prob, reward, done, value)
+
+        if time_step % update_timestep == 0:
+            agent.update()
+
         state = p.getGameState()
-    agent.finish_episode()
-    episode_rewards.append(total_reward)
-    print(f"Episode {episode+1}: Total Reward = {total_reward}")
+        if done:
+            break
 
+    print(f"Episode {i_episode} finished.")
 
-# Save the trained weights
-torch.save(agent.policy.state_dict(), "pixelcopter_policy.pt")
-print("Saved policy weights to pixelcopter_policy.pt")
-
-# Save a video of the trained agent
-def record_video(agent, filename="pixelcopter_agent.mp4", max_steps=1000):
+# --- Save, Record, Evaluate ---
+def record_video(agent, filename="pixelcopter_agent_ppo.mp4", max_steps=1000):
     p.display_screen = True
     p.reset_game()
     state = p.getGameState()
@@ -133,7 +192,7 @@ def record_video(agent, filename="pixelcopter_agent.mp4", max_steps=1000):
     for t in range(max_steps):
         if p.game_over():
             break
-        action = agent.select_action(state)
+        action, _, _, _, _ = agent.select_action(state)
         p.act(action)
         frame = p.getScreenRGB()
         frames.append(frame)
@@ -142,26 +201,3 @@ def record_video(agent, filename="pixelcopter_agent.mp4", max_steps=1000):
     print(f"Saved video to {filename}")
 
 record_video(agent)
-
-# Load and use the trained weights for evaluation
-def evaluate_agent(weights_path="pixelcopter_policy.pt", episodes=5, max_steps=1000):
-    eval_agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
-    eval_agent.policy.load_state_dict(torch.load(weights_path))
-    eval_agent.policy.eval()
-    rewards = []
-    for ep in range(episodes):
-        p.reset_game()
-        state = p.getGameState()
-        total_reward = 0
-        for t in range(max_steps):
-            if p.game_over():
-                break
-            action = eval_agent.select_action(state)
-            reward = p.act(action)
-            total_reward += reward
-            state = p.getGameState()
-        rewards.append(total_reward)
-        print(f"[EVAL] Episode {ep+1}: Total Reward = {total_reward}")
-    print(f"[EVAL] Mean reward over {episodes} episodes: {np.mean(rewards)}")
-
-evaluate_agent()
