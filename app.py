@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import imageio
+import os
 
 
 game = Pixelcopter(width=48, height=48)
@@ -62,6 +63,27 @@ class PPOAgent:
         self.running_state_mean = np.zeros(state_dim)
         self.running_state_std = np.ones(state_dim)
         self.state_count = 0
+
+    def save(self, filepath, episode):
+        torch.save({
+            'episode': episode,
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'running_state_mean': self.running_state_mean,
+            'running_state_std': self.running_state_std,
+            'state_count': self.state_count,
+        }, filepath)
+
+    def load(self, filepath):
+        checkpoint = torch.load(filepath, weights_only=False)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.running_state_mean = checkpoint['running_state_mean']
+        self.running_state_std = checkpoint['running_state_std']
+        self.state_count = checkpoint['state_count']
+        return checkpoint['episode']
 
     def normalize_state(self, state):
         # Simple running mean and std normalization
@@ -160,10 +182,16 @@ action_dim = len(action_set)
 
 agent = PPOAgent(state_dim, action_dim, action_set, lr, gamma, K_epochs, eps_clip)
 
+checkpoint_path = "ppo_checkpoint.pth"
+start_episode = 1
+if os.path.exists(checkpoint_path):
+    start_episode = agent.load(checkpoint_path) + 1
+    print(f"Resuming training from episode {start_episode}")
+
 time_step = 0
 episode_rewards = []
 
-for i_episode in range(1, 2001):
+for i_episode in range(start_episode, 10001):
     p.reset_game()
     state = p.getGameState()
     episode_reward = 0
@@ -189,6 +217,8 @@ for i_episode in range(1, 2001):
     if i_episode % 100 == 0:
         avg_reward = np.mean(episode_rewards[-100:])
         print(f"Episode {i_episode}\tAverage Reward: {avg_reward:.2f}")
+        agent.save(checkpoint_path, i_episode)
+        print(f"Saved checkpoint at episode {i_episode}")
 
 final_avg_reward = np.mean(episode_rewards)
 print(f"Training complete. Final average reward: {final_avg_reward:.2f}")
