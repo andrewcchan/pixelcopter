@@ -15,216 +15,11 @@ p = PLE(game, fps=30, display_screen=True)
 p.init()
 
 
-# Actor-Critic Networks for PPO
-class ActorNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_dim)
-        )
+from sac_agent import SACAgent
 
-    def forward(self, x):
-        return self.fc(x)
-
-class CriticNetwork(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        return self.fc(x)
-
-class PPOAgent:
-    def __init__(self, state_dim, action_dim, allowed_actions, lr, gamma, K_epochs, eps_clip, gae_lambda=0.95):
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
-        self.gae_lambda = gae_lambda
-
-        self.action_map = {i: a for i, a in enumerate(allowed_actions)}
-        self.action_inv_map = {a: i for i, a in enumerate(allowed_actions)}
-
-        self.actor = ActorNetwork(state_dim, action_dim)
-        self.critic = CriticNetwork(state_dim)
-        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
-
-        self.memory = []
-        self.state_dim = state_dim
-        self.running_state_mean = np.zeros(state_dim)
-        self.running_state_std = np.ones(state_dim)
-        self.state_count = 0
-
-    def save(self, filepath, episode):
-        torch.save({
-            'episode': episode,
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'running_state_mean': self.running_state_mean,
-            'running_state_std': self.running_state_std,
-            'state_count': self.state_count,
-        }, filepath)
-
-    def load(self, filepath):
-        checkpoint = torch.load(filepath, weights_only=False)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.running_state_mean = checkpoint['running_state_mean']
-        self.running_state_std = checkpoint['running_state_std']
-        self.state_count = checkpoint['state_count']
-        return checkpoint['episode']
-
-    def normalize_state(self, state):
-        # Simple running mean and std normalization
-        state_vec = np.array(list(state.values()), dtype=np.float32)
-        self.state_count += 1
-        self.running_state_mean = self.running_state_mean + (state_vec - self.running_state_mean) / self.state_count
-        self.running_state_std = self.running_state_std + ((state_vec - self.running_state_mean)**2 - self.running_state_std) / self.state_count
-        std = np.sqrt(self.running_state_std + 1e-5)
-        return (state_vec - self.running_state_mean) / std
-
-    def select_action(self, state):
-        state_norm = self.normalize_state(state)
-        state_tensor = torch.tensor(state_norm, dtype=torch.float32)
-
-        with torch.no_grad():
-            action_logits = self.actor(state_tensor)
-            value = self.critic(state_tensor)
-
-        dist = torch.distributions.Categorical(logits=action_logits)
-        action_idx = dist.sample()
-        log_prob = dist.log_prob(action_idx)
-
-        return self.action_map[action_idx.item()], state_tensor, action_idx, log_prob, value
-
-    def store_transition(self, state, action_idx, log_prob, reward, done, value):
-        self.memory.append((state, action_idx, log_prob, reward, done, value))
-
-    def update(self):
-        old_states, old_actions, old_logprobs, rewards, dones, old_values = zip(*self.memory)
-
-        # Convert to tensor
-        old_states = torch.squeeze(torch.stack(list(old_states), dim=0)).detach()
-        old_actions = torch.squeeze(torch.stack(list(old_actions), dim=0)).detach()
-        old_logprobs = torch.squeeze(torch.stack(list(old_logprobs), dim=0)).detach()
-        old_values = torch.squeeze(torch.stack(list(old_values), dim=0)).detach()
-
-        # Calculate advantages using GAE
-        advantages = []
-        last_advantage = 0
-        last_value = old_values[-1]
-        for i in reversed(range(len(rewards))):
-            if dones[i]:
-                mask = 0
-            else:
-                mask = 1
-            delta = rewards[i] + self.gamma * last_value * mask - old_values[i]
-            last_advantage = delta + self.gamma * self.gae_lambda * last_advantage * mask
-            advantages.insert(0, last_advantage)
-            last_value = old_values[i]
-
-        advantages = torch.tensor(advantages, dtype=torch.float32)
-        returns = advantages + old_values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
-
-        # Optimize policy for K epochs
-        for _ in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-            actor_loss = -torch.min(surr1, surr2).mean()
-
-            critic_loss = 0.5 * (state_values - returns).pow(2).mean()
-
-            loss = actor_loss + 0.5 * critic_loss - 0.01 * dist_entropy.mean()
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-        self.memory = []
-
-    def evaluate(self, state, action):
-        action_logits = self.actor(state)
-        dist = torch.distributions.Categorical(logits=action_logits)
-
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_value = self.critic(state)
-
-        return action_logprobs, torch.squeeze(state_value), dist_entropy
-
-# --- Hyperparameters ---
-lr = 0.0003
-gamma = 0.99
-K_epochs = 10
-eps_clip = 0.2
-update_timestep = 4096
-
-# --- Training ---
-action_set = p.getActionSet()
-state_keys = list(p.getGameState().keys())
-state_dim = len(state_keys)
-action_dim = len(action_set)
-
-agent = PPOAgent(state_dim, action_dim, action_set, lr, gamma, K_epochs, eps_clip)
-
-checkpoint_path = "ppo_checkpoint.pth"
-start_episode = 1
-if os.path.exists(checkpoint_path):
-    start_episode = agent.load(checkpoint_path) + 1
-    print(f"Resuming training from episode {start_episode}")
-
-time_step = 0
-episode_rewards = []
-
-for i_episode in range(start_episode, 10001):
-    p.reset_game()
-    state = p.getGameState()
-    episode_reward = 0
-    for t in range(1000):
-        time_step += 1
-        action, state_tensor, action_idx, log_prob, value = agent.select_action(state)
-        reward = p.act(action)
-        done = p.game_over()
-
-        agent.store_transition(state_tensor, action_idx, log_prob, reward, done, value)
-
-        episode_reward += reward
-
-        if time_step % update_timestep == 0:
-            agent.update()
-
-        state = p.getGameState()
-        if done:
-            break
-
-    episode_rewards.append(episode_reward)
-
-    if i_episode % 100 == 0:
-        avg_reward = np.mean(episode_rewards[-100:])
-        print(f"Episode {i_episode}\tAverage Reward: {avg_reward:.2f}")
-        agent.save(checkpoint_path, i_episode)
-        print(f"Saved checkpoint at episode {i_episode}")
-
-final_avg_reward = np.mean(episode_rewards)
-print(f"Training complete. Final average reward: {final_avg_reward:.2f}")
 
 # --- Save, Record, Evaluate ---
-def record_video(agent, filename="pixelcopter_agent_ppo.mp4", max_steps=1000):
+def record_video(agent, filename="pixelcopter_agent_sac.mp4", max_steps=1000):
     p.display_screen = True
     p.reset_game()
     state = p.getGameState()
@@ -232,7 +27,7 @@ def record_video(agent, filename="pixelcopter_agent_ppo.mp4", max_steps=1000):
     for t in range(max_steps):
         if p.game_over():
             break
-        action, _, _, _, _ = agent.select_action(state)
+        action = agent.select_action(state, evaluate=True)
         p.act(action)
         frame = p.getScreenRGB()
         frames.append(frame)
@@ -240,4 +35,80 @@ def record_video(agent, filename="pixelcopter_agent_ppo.mp4", max_steps=1000):
     imageio.mimsave(filename, frames, fps=30)
     print(f"Saved video to {filename}")
 
-record_video(agent)
+
+def main():
+    # --- Hyperparameters for SAC ---
+    lr = 0.0003
+    gamma = 0.99
+    buffer_size = 100000
+    batch_size = 256
+    tau = 0.005
+    alpha = 0.1  # Lowered alpha
+    target_update_interval = 1
+    learning_starts = 2000 # Increased exploration phase
+    hidden_dim = 256 # Explicitly define network size
+
+    # --- Initialization ---
+    action_set = p.getActionSet()
+    state_dim = len(p.getGameState().keys())
+    action_dim = len(action_set)
+
+    agent = SACAgent(state_dim=state_dim, action_dim=action_dim, allowed_actions=action_set,
+                     lr=lr, gamma=gamma, buffer_size=buffer_size, tau=tau, alpha=alpha)
+    # Note: The hidden_dim is used inside the agent, but not passed here.
+    # The agent was hardcoded to 256, which is what we want.
+
+    checkpoint_path = "sac_checkpoint.pth"
+    start_episode = 1
+    # Let's start fresh
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+
+    # --- Training Loop ---
+    total_steps = 0
+    episode_rewards = []
+    for i_episode in range(start_episode, 401): # Reduced training time
+        p.reset_game()
+        state = p.getGameState()
+        episode_reward = 0
+        done = False
+
+        while not done:
+            total_steps += 1
+            if total_steps < learning_starts:
+                action = random.choice(action_set)
+            else:
+                action = agent.select_action(state)
+
+            reward = p.act(action)
+            # Clip rewards to be between -1 and 1, a common practice
+            reward = np.clip(reward, -1, 1)
+
+            next_state = p.getGameState()
+            done = p.game_over()
+
+            agent.store_transition(state, action, reward, next_state, done)
+
+            if total_steps >= learning_starts and total_steps % 4 == 0: # Update every 4 steps
+                agent.update(batch_size, target_update_interval, total_steps)
+
+            state = next_state
+            episode_reward += reward
+
+        episode_rewards.append(episode_reward)
+        if i_episode % 10 == 0:
+            avg_reward = np.mean(episode_rewards[-10:])
+            print(f"Episode {i_episode} | Avg Reward (last 10): {avg_reward:.2f} | Alpha: {agent.log_alpha.exp().item():.4f}")
+
+        if i_episode % 50 == 0:
+            print(f"--------------------------------------------------------")
+            print(f"Saving checkpoint at episode {i_episode}")
+            print(f"--------------------------------------------------------")
+            agent.save(checkpoint_path, i_episode)
+
+    print("Training complete.")
+    record_video(agent)
+
+
+if __name__ == '__main__':
+    main()
