@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 import imageio
 import os
+import argparse
 
 
 game = Pixelcopter(width=48, height=48)
@@ -37,6 +38,15 @@ def record_video(agent, filename="pixelcopter_agent_sac.mp4", max_steps=1000):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train or record a SAC agent for Pixelcopter.")
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "record"],
+                        help="Mode to run the script in. 'train' will train a new agent, "
+                             "'record' will load a pre-trained agent and record a video.")
+    parser.add_argument("--checkpoint", type=str, default="sac_checkpoint.pth",
+                        help="Path to the checkpoint file to load or save.")
+    args = parser.parse_args()
+
+
     # --- Hyperparameters for SAC ---
     lr = 0.0003
     gamma = 0.99
@@ -55,14 +65,21 @@ def main():
 
     agent = SACAgent(state_dim=state_dim, action_dim=action_dim, allowed_actions=action_set,
                      lr=lr, gamma=gamma, buffer_size=buffer_size, tau=tau, alpha=alpha)
-    # Note: The hidden_dim is used inside the agent, but not passed here.
-    # The agent was hardcoded to 256, which is what we want.
 
-    checkpoint_path = "sac_checkpoint.pth"
+    if args.mode == "record":
+        if os.path.exists(args.checkpoint):
+            print(f"Loading checkpoint from {args.checkpoint}")
+            agent.load(args.checkpoint)
+            record_video(agent, filename="pixelcopter_agent_sac_loaded.mp4")
+        else:
+            print(f"Checkpoint file not found at {args.checkpoint}. Please train the agent first.")
+        return
+
+    # --- Training Logic (only for mode='train') ---
     start_episode = 1
     # Let's start fresh
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
+    if os.path.exists(args.checkpoint):
+        os.remove(args.checkpoint)
 
     # --- Training Loop ---
     total_steps = 0
@@ -104,7 +121,7 @@ def main():
             print(f"--------------------------------------------------------")
             print(f"Saving checkpoint at episode {i_episode}")
             print(f"--------------------------------------------------------")
-            agent.save(checkpoint_path, i_episode)
+            agent.save(args.checkpoint, i_episode)
 
     print("Training complete.")
     record_video(agent)
