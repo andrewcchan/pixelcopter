@@ -1,1 +1,5 @@
 venv
+pixelcopter_actor.pt
+pixelcopter_agent.mp4
+pixelcopter_policy.pt
+__pycache__/
