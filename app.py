@@ -1,167 +1,110 @@
-from ple.games.pixelcopter import Pixelcopter
-from ple import PLE
-import numpy as np
-import random
-import time
+
+import os
 import torch
-import torch.nn as nn
-import torch.optim as optim
+import numpy as np
 import imageio
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.monitor import Monitor
+from ple_wrapper import PLEPixelcopterGym
 
+def train():
+    # Create the environment
+    # We use DummyVecEnv because VecNormalize requires a VecEnv
+    env = DummyVecEnv([lambda: Monitor(PLEPixelcopterGym())])
 
-game = Pixelcopter(width=48, height=48)
-p = PLE(game, fps=30, display_screen=True)
-p.init()
+    # Normalize observations (crucial for PPO) and rewards (optional, but often good)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
 
+    # Check if we can use GPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-# Policy Gradient Agent using REINFORCE
-class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, output_dim),
-            nn.Softmax(dim=-1)
-        )
-    def forward(self, x):
-        return self.fc(x)
+    # Define the PPO model
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
+        device=device
+    )
 
-class PolicyGradientAgent:
-    def __init__(self, allowed_actions, state_keys, lr=1e-3):
-        self.allowed_actions = allowed_actions
-        self.state_keys = state_keys
-        self.action_map = {i: a for i, a in enumerate(allowed_actions)}
-        self.action_inv_map = {a: i for i, a in enumerate(allowed_actions)}
-        self.policy = PolicyNetwork(len(state_keys), len(allowed_actions))
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
-        self.running_state_mean = np.zeros(len(state_keys))
-        self.running_state_std = np.ones(len(state_keys))
-        self.state_count = 0
-        self.baseline = 0.0
-        self.baseline_alpha = 0.99  # running average baseline
-        self.entropy_beta = 0.01    # entropy regularization strength
+    # Train the agent
+    # Increased steps to ensure better convergence
+    TOTAL_TIMESTEPS = 500000
+    print(f"Training for {TOTAL_TIMESTEPS} timesteps...")
+    model.learn(total_timesteps=TOTAL_TIMESTEPS)
 
-    def normalize_state(self, state):
-        # Update running mean and std, then normalize
-        state_vec = np.array([state[k] for k in self.state_keys], dtype=np.float32)
-        self.state_count += 1
-        self.running_state_mean = self.running_state_mean * (1 - 1/self.state_count) + state_vec * (1/self.state_count)
-        self.running_state_std = self.running_state_std * (1 - 1/self.state_count) + ((state_vec - self.running_state_mean) ** 2) * (1/self.state_count)
-        std = np.sqrt(self.running_state_std + 1e-8)
-        return (state_vec - self.running_state_mean) / std
+    # Save the model
+    model_path = "pixelcopter_ppo_model"
+    model.save(model_path)
+    print(f"Saved model to {model_path}")
 
-    def select_action(self, state):
-        state_vec = self.normalize_state(state)
-        state_tensor = torch.tensor(state_vec, dtype=torch.float32)
-        probs = self.policy(state_tensor)
-        m = torch.distributions.Categorical(probs)
-        action_idx = m.sample()
-        self.log_probs.append(m.log_prob(action_idx))
-        self.entropies.append(m.entropy())
-        return self.action_map[action_idx.item()]
+    # Save the normalization stats
+    env.save("vec_normalize.pkl")
+    print("Saved normalization stats to vec_normalize.pkl")
 
-    def record_reward(self, reward):
-        self.rewards.append(reward)
+def evaluate_and_record():
+    print("Recording video of the trained agent...")
 
-    def finish_episode(self, gamma=0.99):
-        R = 0
-        returns = []
-        for r in reversed(self.rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, dtype=torch.float32)
-        # Baseline: running mean of returns
-        mean_return = returns.mean().item()
-        self.baseline = self.baseline_alpha * self.baseline + (1 - self.baseline_alpha) * mean_return
-        baseline_tensor = torch.full_like(returns, self.baseline)
-        advantages = returns - baseline_tensor
-        # Normalize advantages
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        log_probs = torch.stack(self.log_probs)
-        entropies = torch.stack(self.entropies)
-        loss = -torch.sum(log_probs * advantages) - self.entropy_beta * torch.sum(entropies)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
+    # We need an environment with render_mode='rgb_array' for video
+    # We must wrap it exactly as during training to use the stats
+    eval_env = DummyVecEnv([lambda: PLEPixelcopterGym(render_mode='rgb_array')])
 
-# ...existing code...
-action_set = p.getActionSet()
+    # Load the saved normalization stats
+    # We disable norm_reward because we want to see the real reward in evaluation
+    eval_env = VecNormalize.load("vec_normalize.pkl", eval_env)
+    eval_env.training = False # Do not update stats during evaluation
+    eval_env.norm_reward = False
 
-reward = 0.0
-nb_episodes = 1000
-max_steps = 1000
-action_set = p.getActionSet()
-state_keys = list(p.getGameState().keys())
-agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
+    # Load model
+    model = PPO.load("pixelcopter_ppo_model", env=eval_env)
 
-episode_rewards = []
-for episode in range(nb_episodes):
-    p.reset_game()
-    state = p.getGameState()
-    total_reward = 0
-    for t in range(max_steps):
-        if p.game_over():
-            break
-        action = agent.select_action(state)
-        reward = p.act(action)
-        agent.record_reward(reward)
-        total_reward += reward
-        state = p.getGameState()
-    agent.finish_episode()
-    episode_rewards.append(total_reward)
-    print(f"Episode {episode+1}: Total Reward = {total_reward}")
-
-
-# Save the trained weights
-torch.save(agent.policy.state_dict(), "pixelcopter_policy.pt")
-print("Saved policy weights to pixelcopter_policy.pt")
-
-# Save a video of the trained agent
-def record_video(agent, filename="pixelcopter_agent.mp4", max_steps=1000):
-    p.display_screen = True
-    p.reset_game()
-    state = p.getGameState()
     frames = []
-    for t in range(max_steps):
-        if p.game_over():
+    obs = eval_env.reset()
+    done = False
+    total_reward = 0
+
+    # Record until game over or a very high limit
+    # "Win" condition usually means surviving a long time or reaching a high score.
+    # We set a high limit (e.g. 5000 steps).
+    max_steps = 5000
+    for i in range(max_steps):
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, terminated, info = eval_env.step(action)
+
+        # In VecEnv, terminated is an array of booleans.
+        # But wait, VecEnv step returns (obs, rewards, dones, infos)
+        # 'terminated' here is actually 'dones' (terminated or truncated)
+
+        total_reward += reward[0]
+
+        # Capture frame
+        # render() in VecEnv might tricky.
+        # But our env supports render().
+        # We can call render on the wrapped env.
+        frame = eval_env.envs[0].render()
+        if frame is not None:
+            frames.append(frame)
+
+        if terminated[0]:
+            print(f"Episode finished at step {i+1}")
             break
-        action = agent.select_action(state)
-        p.act(action)
-        frame = p.getScreenRGB()
-        frames.append(frame)
-        state = p.getGameState()
-    imageio.mimsave(filename, frames, fps=30)
-    print(f"Saved video to {filename}")
 
-record_video(agent)
+    print(f"Evaluation episode reward: {total_reward}")
+    video_path = "pixelcopter_agent.mp4"
+    imageio.mimsave(video_path, frames, fps=30)
+    print(f"Saved video to {video_path}")
 
-# Load and use the trained weights for evaluation
-def evaluate_agent(weights_path="pixelcopter_policy.pt", episodes=5, max_steps=1000):
-    eval_agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
-    eval_agent.policy.load_state_dict(torch.load(weights_path))
-    eval_agent.policy.eval()
-    rewards = []
-    for ep in range(episodes):
-        p.reset_game()
-        state = p.getGameState()
-        total_reward = 0
-        for t in range(max_steps):
-            if p.game_over():
-                break
-            action = eval_agent.select_action(state)
-            reward = p.act(action)
-            total_reward += reward
-            state = p.getGameState()
-        rewards.append(total_reward)
-        print(f"[EVAL] Episode {ep+1}: Total Reward = {total_reward}")
-    print(f"[EVAL] Mean reward over {episodes} episodes: {np.mean(rewards)}")
-
-evaluate_agent()
+if __name__ == "__main__":
+    train()
+    evaluate_and_record()
