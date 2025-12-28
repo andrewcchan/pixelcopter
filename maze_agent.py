@@ -6,13 +6,15 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import random
+import imageio
 
 class MazeEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
-    def __init__(self, size=10, maze_layout=None):
+    def __init__(self, size=10, maze_layout=None, render_mode=None):
         super().__init__()
         self.size = size
+        self.render_mode = render_mode
 
         # 0: Empty, 1: Wall, 2: Agent, 3: Goal
         self.observation_space = spaces.Box(low=0, high=3, shape=(1, size, size), dtype=np.float32)
@@ -106,20 +108,40 @@ class MazeEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, {}
 
     def render(self):
-        print("\n" + "-" * self.size)
-        grid = self.grid.copy()
-        grid[self.agent_pos] = 2
-        grid[self.goal_pos] = 3
+        if self.render_mode == "human":
+            print("\n" + "-" * self.size)
+            grid = self.grid.copy()
+            grid[self.agent_pos] = 2
+            grid[self.goal_pos] = 3
 
-        for r in range(self.size):
-            line = ""
-            for c in range(self.size):
-                if grid[r, c] == 1: line += "#"
-                elif grid[r, c] == 0: line += " "
-                elif grid[r, c] == 2: line += "A"
-                elif grid[r, c] == 3: line += "G"
-            print(line)
-        print("-" * self.size + "\n")
+            for r in range(self.size):
+                line = ""
+                for c in range(self.size):
+                    if grid[r, c] == 1: line += "#"
+                    elif grid[r, c] == 0: line += " "
+                    elif grid[r, c] == 2: line += "A"
+                    elif grid[r, c] == 3: line += "G"
+                print(line)
+            print("-" * self.size + "\n")
+
+        elif self.render_mode == "rgb_array":
+            scale = 40
+            h, w = self.size, self.size
+            img = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
+
+            for r in range(h):
+                for c in range(w):
+                    color = [255, 255, 255] # Empty (White)
+                    if self.grid[r, c] == 1:
+                        color = [0, 0, 0] # Wall (Black)
+
+                    if (r, c) == self.agent_pos:
+                        color = [255, 0, 0] # Agent (Red)
+                    elif (r, c) == self.goal_pos:
+                        color = [0, 255, 0] # Goal (Green)
+
+                    img[r*scale:(r+1)*scale, c*scale:(c+1)*scale] = color
+            return img
 
 
 class ActorCritic(nn.Module):
@@ -221,7 +243,8 @@ def train():
 def evaluate(model):
     print("\nStarting Evaluation on New Mazes...")
     maze_size = 5
-    env = MazeEnv(size=maze_size)
+    # Use rgb_array mode for video recording
+    env = MazeEnv(size=maze_size, render_mode="rgb_array")
 
     # Generate 5 NEW random mazes
     eval_mazes = []
@@ -230,11 +253,16 @@ def evaluate(model):
         eval_mazes.append(layout)
 
     success_count = 0
+    all_frames = []
 
     for i, layout in enumerate(eval_mazes):
         print(f"\nEval Maze {i+1}:")
         obs, _ = env.reset(options={"layout": layout})
-        env.render()
+
+        # Capture initial frame
+        frame = env.render()
+        if frame is not None:
+             all_frames.append(frame)
 
         done = False
         steps = 0
@@ -251,6 +279,11 @@ def evaluate(model):
             total_reward += reward
             steps += 1
 
+            # Capture frame
+            frame = env.render()
+            if frame is not None:
+                all_frames.append(frame)
+
         if terminated:
             print("Status: SUCCESS")
             success_count += 1
@@ -259,6 +292,11 @@ def evaluate(model):
         print(f"Reward: {total_reward:.2f}")
 
     print(f"\nEvaluation Complete. Success Rate: {success_count}/5")
+
+    if all_frames:
+        print("Saving evaluation video to maze_solution.mp4...")
+        imageio.mimsave("maze_solution.mp4", all_frames, fps=5)
+        print("Video saved.")
 
 if __name__ == "__main__":
     trained_model = train()
