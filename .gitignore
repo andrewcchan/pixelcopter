@@ -1,1 +1,4 @@
-venv
+venvpixelcopter_rllib_checkpoint/
+*.mp4
+__pycache__/
+*.pyc
