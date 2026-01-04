@@ -1,167 +1,236 @@
+
+import os
+import argparse
+import numpy as np
+import torch
+import imageio
+import gymnasium as gym
+from gymnasium import spaces
+
+# Third-party imports
 from ple.games.pixelcopter import Pixelcopter
 from ple import PLE
-import numpy as np
-import random
-import time
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import imageio
+
+import ray
+from ray import tune
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.algorithm import Algorithm
 
 
-game = Pixelcopter(width=48, height=48)
-p = PLE(game, fps=30, display_screen=True)
-p.init()
+# -----------------------------------------------------------------------------
+# Environment Wrapper
+# -----------------------------------------------------------------------------
+
+class PixelcopterEnv(gym.Env):
+    def __init__(self, config=None):
+        self.width = 48
+        self.height = 48
+        # Using a dummy driver for headless environments, but allow overriding
+        if os.environ.get("SDL_VIDEODRIVER") is None:
+             # On a headless server (like this sandbox), we might want to default to dummy if not set.
+             # But on a local MacBook, we might want the window.
+             # The training script sets this via runtime_env, so we can leave it flexible here.
+             pass
+
+        self.game = Pixelcopter(width=self.width, height=self.height)
+        # display_screen=False for speed during training, True might be needed for rendering
+        display_screen = config.get("display_screen", False) if config else False
+        self.p = PLE(self.game, fps=30, display_screen=display_screen)
+        self.p.init()
+
+        self.action_set = self.p.getActionSet()
+        self.action_space = spaces.Discrete(len(self.action_set))
+
+        # Determine observation space
+        # We need to run one step to get the state keys and size
+        self.p.reset_game()
+        state = self.p.getGameState()
+        self.state_keys = list(state.keys())
+        # Sort keys to ensure consistent order
+        self.state_keys.sort()
+
+        low = -np.inf
+        high = np.inf
+        self.observation_space = spaces.Box(low=low, high=high, shape=(len(self.state_keys),), dtype=np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.p.reset_game()
+        observation = self._get_obs()
+        self.steps = 0
+        info = {}
+        return observation, info
+
+    def step(self, action):
+        # Map index to action
+        act = self.action_set[action]
+        reward = self.p.act(act)
+        self.steps += 1
+
+        observation = self._get_obs()
+        terminated = self.p.game_over()
+        truncated = self.steps >= 2000 # Force truncation if too long
+
+        if terminated or truncated:
+             # Just for debug/info
+             # print(f"Episode finished. Steps: {self.steps}, Reward: {reward}, Terminated: {terminated}, Truncated: {truncated}")
+             pass
+
+        info = {}
+        return observation, reward, terminated, truncated, info
+
+    def _get_obs(self):
+        state = self.p.getGameState()
+        obs = np.array([state[k] for k in self.state_keys], dtype=np.float32)
+        return obs
+
+    def render(self):
+        # PLE returns rotated image for some reason, usually
+        return self.p.getScreenRGB()
 
 
-# Policy Gradient Agent using REINFORCE
-class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, output_dim),
-            nn.Softmax(dim=-1)
+# -----------------------------------------------------------------------------
+# Training Function
+# -----------------------------------------------------------------------------
+
+def train_pixelcopter(num_iterations=10, checkpoint_path="pixelcopter_rllib_checkpoint"):
+    # Initialize Ray
+    # On a macbook, this works fine.
+    # Set SDL_VIDEODRIVER to dummy to avoid pygame issues on headless systems (like this sandbox)
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, runtime_env={"env_vars": {"SDL_VIDEODRIVER": "dummy"}})
+
+    # Register the environment
+    tune.register_env("pixelcopter_env", lambda config: PixelcopterEnv(config))
+
+    # Configure PPO
+    config = (
+        PPOConfig()
+        .environment("pixelcopter_env")
+        .framework("torch")
+        .env_runners(num_env_runners=1) # 1 worker is usually fine for local macbook
+        .training(
+            gamma=0.99,
+            lr=0.0001,
+            train_batch_size_per_learner=2000,
         )
-    def forward(self, x):
-        return self.fc(x)
+        .resources(num_gpus=0) # Assume CPU for macbook unless mps is supported by ray (which is WIP)
+    )
 
-class PolicyGradientAgent:
-    def __init__(self, allowed_actions, state_keys, lr=1e-3):
-        self.allowed_actions = allowed_actions
-        self.state_keys = state_keys
-        self.action_map = {i: a for i, a in enumerate(allowed_actions)}
-        self.action_inv_map = {a: i for i, a in enumerate(allowed_actions)}
-        self.policy = PolicyNetwork(len(state_keys), len(allowed_actions))
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
-        self.running_state_mean = np.zeros(len(state_keys))
-        self.running_state_std = np.ones(len(state_keys))
-        self.state_count = 0
-        self.baseline = 0.0
-        self.baseline_alpha = 0.99  # running average baseline
-        self.entropy_beta = 0.01    # entropy regularization strength
+    # Build algorithm
+    algo = config.build()
 
-    def normalize_state(self, state):
-        # Update running mean and std, then normalize
-        state_vec = np.array([state[k] for k in self.state_keys], dtype=np.float32)
-        self.state_count += 1
-        self.running_state_mean = self.running_state_mean * (1 - 1/self.state_count) + state_vec * (1/self.state_count)
-        self.running_state_std = self.running_state_std * (1 - 1/self.state_count) + ((state_vec - self.running_state_mean) ** 2) * (1/self.state_count)
-        std = np.sqrt(self.running_state_std + 1e-8)
-        return (state_vec - self.running_state_mean) / std
+    print("Training started...")
+    for i in range(num_iterations):
+        result = algo.train()
 
-    def select_action(self, state):
-        state_vec = self.normalize_state(state)
-        state_tensor = torch.tensor(state_vec, dtype=torch.float32)
-        probs = self.policy(state_tensor)
-        m = torch.distributions.Categorical(probs)
-        action_idx = m.sample()
-        self.log_probs.append(m.log_prob(action_idx))
-        self.entropies.append(m.entropy())
-        return self.action_map[action_idx.item()]
+        mean_reward = result.get('env_runners', {}).get('episode_reward_mean')
+        if mean_reward is None:
+             # Fallback for old API stack or if structure is different
+             mean_reward = result.get('episode_reward_mean', 'N/A')
 
-    def record_reward(self, reward):
-        self.rewards.append(reward)
+        print(f"Iteration {i}: mean_reward={mean_reward}")
 
-    def finish_episode(self, gamma=0.99):
-        R = 0
-        returns = []
-        for r in reversed(self.rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns = torch.tensor(returns, dtype=torch.float32)
-        # Baseline: running mean of returns
-        mean_return = returns.mean().item()
-        self.baseline = self.baseline_alpha * self.baseline + (1 - self.baseline_alpha) * mean_return
-        baseline_tensor = torch.full_like(returns, self.baseline)
-        advantages = returns - baseline_tensor
-        # Normalize advantages
-        if len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        log_probs = torch.stack(self.log_probs)
-        entropies = torch.stack(self.entropies)
-        loss = -torch.sum(log_probs * advantages) - self.entropy_beta * torch.sum(entropies)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.log_probs = []
-        self.entropies = []
-        self.rewards = []
+    # Save the trained policy
+    # Ensure the path is absolute or a valid URI
+    final_checkpoint_path = algo.save_to_path(os.path.abspath(checkpoint_path))
+    print(f"Final checkpoint saved at {final_checkpoint_path}")
 
-# ...existing code...
-action_set = p.getActionSet()
-
-reward = 0.0
-nb_episodes = 1000
-max_steps = 1000
-action_set = p.getActionSet()
-state_keys = list(p.getGameState().keys())
-agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
-
-episode_rewards = []
-for episode in range(nb_episodes):
-    p.reset_game()
-    state = p.getGameState()
-    total_reward = 0
-    for t in range(max_steps):
-        if p.game_over():
-            break
-        action = agent.select_action(state)
-        reward = p.act(action)
-        agent.record_reward(reward)
-        total_reward += reward
-        state = p.getGameState()
-    agent.finish_episode()
-    episode_rewards.append(total_reward)
-    print(f"Episode {episode+1}: Total Reward = {total_reward}")
+    return algo, final_checkpoint_path
 
 
-# Save the trained weights
-torch.save(agent.policy.state_dict(), "pixelcopter_policy.pt")
-print("Saved policy weights to pixelcopter_policy.pt")
+# -----------------------------------------------------------------------------
+# Recording Function
+# -----------------------------------------------------------------------------
 
-# Save a video of the trained agent
-def record_video(agent, filename="pixelcopter_agent.mp4", max_steps=1000):
-    p.display_screen = True
-    p.reset_game()
-    state = p.getGameState()
+def record_video(checkpoint_path="pixelcopter_rllib_checkpoint", video_filename="pixelcopter_rllib.mp4"):
+    checkpoint_path = os.path.abspath(checkpoint_path)
+
+    # Initialize Ray
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, runtime_env={"env_vars": {"SDL_VIDEODRIVER": "dummy"}})
+
+    # We need to register the env again just in case (if run separately)
+    try:
+        tune.register_env("pixelcopter_env", lambda config: PixelcopterEnv(config))
+    except Exception:
+        pass # Already registered
+
+    print(f"Loading checkpoint from {checkpoint_path}")
+    algo = Algorithm.from_checkpoint(checkpoint_path)
+
+    # Create the environment for recording
+    env = PixelcopterEnv(config={"display_screen": True})
+
+    obs, info = env.reset()
     frames = []
-    for t in range(max_steps):
-        if p.game_over():
-            break
-        action = agent.select_action(state)
-        p.act(action)
-        frame = p.getScreenRGB()
+
+    done = False
+    total_reward = 0
+    steps = 0
+    max_steps = 1000
+
+    print("Recording video...")
+
+    # Get the RLModule for inference
+    module = algo.get_module("default_policy")
+
+    while not done and steps < max_steps:
+        # Compute action
+        # Prepare batch
+        obs_batch = torch.from_numpy(obs).unsqueeze(0).float()
+
+        # Forward pass
+        # The new API stack uses torch input dicts
+        input_dict = {"obs": obs_batch}
+
+        with torch.no_grad():
+             # Forward inference
+             action_dist_inputs = module.forward_inference(input_dict)
+             # We need to sample from the distribution or take the argmax
+             # PPO usually outputs logits for categorical
+             logits = action_dist_inputs["action_dist_inputs"]
+             dist = torch.distributions.Categorical(logits=logits)
+             action = dist.sample().item()
+
+        # Step the environment
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        steps += 1
+
+        # Capture frame
+        frame = env.render()
         frames.append(frame)
-        state = p.getGameState()
-    imageio.mimsave(filename, frames, fps=30)
-    print(f"Saved video to {filename}")
 
-record_video(agent)
+        done = terminated or truncated
 
-# Load and use the trained weights for evaluation
-def evaluate_agent(weights_path="pixelcopter_policy.pt", episodes=5, max_steps=1000):
-    eval_agent = PolicyGradientAgent(allowed_actions=action_set, state_keys=state_keys)
-    eval_agent.policy.load_state_dict(torch.load(weights_path))
-    eval_agent.policy.eval()
-    rewards = []
-    for ep in range(episodes):
-        p.reset_game()
-        state = p.getGameState()
-        total_reward = 0
-        for t in range(max_steps):
-            if p.game_over():
-                break
-            action = eval_agent.select_action(state)
-            reward = p.act(action)
-            total_reward += reward
-            state = p.getGameState()
-        rewards.append(total_reward)
-        print(f"[EVAL] Episode {ep+1}: Total Reward = {total_reward}")
-    print(f"[EVAL] Mean reward over {episodes} episodes: {np.mean(rewards)}")
+    print(f"Episode finished. Total Reward: {total_reward}, Steps: {steps}")
 
-evaluate_agent()
+    # Save video
+    imageio.mimsave(video_filename, frames, fps=30)
+    print(f"Saved video to {video_filename}")
+
+
+# -----------------------------------------------------------------------------
+# Main Execution
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train or Record Pixelcopter Agent with RLlib")
+    parser.add_argument("--mode", type=str, default="train_and_record", choices=["train", "record", "train_and_record"], help="Mode of operation")
+    parser.add_argument("--checkpoint", type=str, default="pixelcopter_rllib_checkpoint", help="Path to checkpoint directory")
+    parser.add_argument("--iterations", type=int, default=10, help="Number of training iterations")
+    parser.add_argument("--video", type=str, default="pixelcopter_rllib.mp4", help="Output video filename")
+
+    args = parser.parse_args()
+
+    if args.mode in ["train", "train_and_record"]:
+        _, checkpoint_path = train_pixelcopter(num_iterations=args.iterations, checkpoint_path=args.checkpoint)
+        # Update checkpoint path for recording if we just trained
+        args.checkpoint = checkpoint_path
+
+    if args.mode in ["record", "train_and_record"]:
+        if not os.path.exists(args.checkpoint):
+            print(f"Error: Checkpoint path {args.checkpoint} does not exist.")
+        else:
+            record_video(checkpoint_path=args.checkpoint, video_filename=args.video)
