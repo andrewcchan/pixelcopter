@@ -1,1 +1,5 @@
 venv
+pixelcopter_rllib_checkpoint/
+# *.mp4  <-- Commented out to allow pushing the video as requested
+__pycache__/
+*.pyc
